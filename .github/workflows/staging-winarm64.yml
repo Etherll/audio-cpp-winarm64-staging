@@ -240,10 +240,21 @@ jobs:
 
       - name: Build native server, eSpeak and CUDA audio kernels
         run: |
-          & tooling/scripts/unsloth/build_windows_arm64.ps1 `
+          # staging: keep the 300 MB warning log out of the job log; print only errors.
+          $log = "$env:RUNNER_TEMP/arm64-build.log"
+          pwsh -NoProfile -File tooling/scripts/unsloth/build_windows_arm64.ps1 `
             -Source "$env:GITHUB_WORKSPACE/src" -Build "$env:GITHUB_WORKSPACE/build" `
-            -Version '${{ needs.resolve.outputs.tag }}' -Accelerator '${{ matrix.accel }}'
-          if ($LASTEXITCODE -ne 0) { throw 'ARM64 build failed' }
+            -Version '${{ needs.resolve.outputs.tag }}' -Accelerator '${{ matrix.accel }}' *> $log
+          $code = $LASTEXITCODE
+          "build exit code: $code; log lines: $((Get-Content $log).Count)"
+          if ($code -ne 0) {
+            "===== error lines"
+            Select-String -Path $log -Pattern 'FAILED:|: error|error:|fatal error|LINK : |LNK[0-9]{4}|nvcc fatal|ptxas|Command failed|Exception' |
+              Where-Object { $_.Line -notmatch 'warning' } | Select-Object -First 60 | ForEach-Object { $_.Line.Substring(0, [Math]::Min(1200, $_.Line.Length)) }
+            "===== last 80 lines"
+            Get-Content $log -Tail 80
+            throw 'ARM64 build failed'
+          }
           "BIN_DIR=$env:GITHUB_WORKSPACE/build/bin" | Add-Content $env:GITHUB_ENV
 
       - name: "staging: dump eSpeak sub-build logs"
@@ -275,8 +286,12 @@ jobs:
           $redist = Get-ChildItem "$vs/VC/Redist/MSVC" -Directory |
             Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending |
             Select-Object -First 1
-          $crt = Join-Path $redist.FullName 'arm64/Microsoft.VC143.CRT'
-          if (-not (Test-Path -LiteralPath $crt)) { throw "missing ARM64 VC runtime: $crt" }
+          # staging: VS 18 on windows-11-arm ships VC145, not VC143.
+          "redist: $($redist.FullName)"; Get-ChildItem (Join-Path $redist.FullName 'arm64') -Directory | ForEach-Object { "  $($_.Name)" }
+          $crt = Get-ChildItem (Join-Path $redist.FullName 'arm64') -Directory -Filter 'Microsoft.VC*.CRT' |
+            Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName
+          if (-not $crt -or -not (Test-Path -LiteralPath $crt)) { throw "missing ARM64 VC runtime under $($redist.FullName)/arm64" }
+          "using $crt"
           Get-ChildItem "$crt/*.dll" | Where-Object { $_.Name -match '^(vcruntime140|msvcp140)' } |
             Copy-Item -Destination $env:BIN_DIR
 
