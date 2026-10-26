@@ -292,8 +292,16 @@ jobs:
             Sort-Object Name -Descending | Select-Object -First 1 -ExpandProperty FullName
           if (-not $crt -or -not (Test-Path -LiteralPath $crt)) { throw "missing ARM64 VC runtime under $($redist.FullName)/arm64" }
           "using $crt"
-          Get-ChildItem "$crt/*.dll" | Where-Object { $_.Name -match '^(vcruntime140|msvcp140)' } |
-            Copy-Item -Destination $env:BIN_DIR
+          # VS 18's arm64 CRT folder also carries an x64 vcruntime140_1.dll; ship ARM64 PEs only.
+          function Get-PEMachine([string]$path) {
+            $b = [IO.File]::ReadAllBytes($path); $o = [BitConverter]::ToInt32($b, 0x3C)
+            [BitConverter]::ToUInt16($b, $o + 4)
+          }
+          Get-ChildItem "$crt/*.dll" | Where-Object { $_.Name -match '^(vcruntime140|msvcp140)' } | ForEach-Object {
+            $m = Get-PEMachine $_.FullName
+            if ($m -eq 0xAA64) { Copy-Item $_.FullName -Destination $env:BIN_DIR; "  + $($_.Name)" }
+            else { "  - skip $($_.Name) (machine 0x{0:x4})" -f $m }
+          }
 
       - name: Sign Windows ARM64 binaries
         id: sign

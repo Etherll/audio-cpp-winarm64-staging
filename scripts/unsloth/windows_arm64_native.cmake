@@ -28,4 +28,9 @@ if(ENGINE_ENABLE_CUDA)
         set(CUDA_${_lib}_LIBRARY "${_cuda}/lib/arm64/${_lib}.lib" CACHE FILEPATH "" FORCE)
     endforeach()
     set(CUDA_cuda_driver_LIBRARY "${_cuda}/lib/arm64/cuda.lib" CACHE FILEPATH "" FORCE)
+    # audio.cpp's attention_fallback.cpp calls cuDeviceGet/cuDeviceGetAttribute and
+    # expects ggml-cuda to link the driver, which GGML_CUDA_NO_VMM drops. Link it
+    # delay-loaded so a machine without nvcuda.dll can still start on CPU.
+    set(CMAKE_EXE_LINKER_FLAGS_INIT "${_cuda}/lib/arm64/cuda.lib delayimp.lib /DELAYLOAD:nvcuda.dll")
+    set(CMAKE_SHARED_LINKER_FLAGS_INIT "${_cuda}/lib/arm64/cuda.lib delayimp.lib /DELAYLOAD:nvcuda.dll")
 endif()
