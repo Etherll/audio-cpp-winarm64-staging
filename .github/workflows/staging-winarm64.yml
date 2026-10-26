@@ -1,0 +1,352 @@
+# STAGING ONLY (Etherll/audio-cpp-winarm64-staging): unslothai/audio.cpp#1 @ 6b71e29 Windows ARM64 legs.
+# resolve + windows-arm64 copied verbatim from the PR; no signing, no publish.
+name: "staging: windows-arm64 prebuilts (unslothai/audio.cpp#1)"
+on:
+  push:
+    branches: ['main']
+  workflow_dispatch:
+permissions:
+  contents: read
+env:
+  # CMAKE_CUDA_ARCHITECTURES. audio.cpp rewrites 12X to 12Xa (Blackwell
+  # arch-specific SASS), and arch-specific PTX cannot JIT on any other GPU, so
+  # the forward-compatible PTX is compute_100: sm_103/110/121 and future GPUs
+  # JIT from it. CUDA 13 dropped sm_50-72, so both lines share one list.
+  CUDA12_ARCHS: '75-real;80-real;86-real;89-real;90-real;100-real;120-real;100-virtual'
+  CUDA13_ARCHS: '75-real;80-real;86-real;89-real;90-real;100-real;120-real;100-virtual'
+  # Linux containers + Windows Jimver installs. 13.0 matches torch's cu130
+  # wheels, whose libcudart.so.13 / cudart64_13.dll Studio reuses.
+  CUDA12_TOOLKIT: '12.8.1'
+  CUDA13_TOOLKIT: '13.0.2'
+  VULKAN_VERSION: '1.4.357.0'
+  # Keep in step with HF_REVISION in scripts/unsloth/validate_bundle.py.
+  SMOKE_MODELS_KEY: 'audiocpp-smoke-models-83c5d96c03023ff5a7712570d057ce26c8769f98-v1'
+  PYTHONUNBUFFERED: '1'
+
+jobs:
+  resolve:
+    name: Resolve tag + stamp source
+    # arm64, like assemble and alert: these only run git, tar, gh, jq and
+    # python, nothing executes a built binary, and in unslothai/whisper.cpp +
+    # llama.cpp ubuntu-22.04-arm waited a median 2.5 min for a runner (max 38)
+    # against 10 min (p90 59) for ubuntu-22.04. resolve gates every build.
+    runs-on: ubuntu-22.04-arm
+    permissions:
+      contents: read
+    outputs:
+      upstream_tag: ${{ steps.r.outputs.upstream_tag }}
+      tag: ${{ steps.r.outputs.tag }}
+      commit: ${{ steps.r.outputs.commit }}
+      repo: ${{ steps.r.outputs.repo }}
+      source_artifact: ${{ steps.r.outputs.source_artifact }}
+      exists: ${{ steps.r.outputs.exists }}
+      espeak_commit: ${{ steps.r.outputs.espeak_commit }}
+      sign_windows: ${{ steps.r.outputs.sign_windows }}
+      publish: ${{ steps.r.outputs.publish }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UT: v0.9.2-drama3-base-small
+      SUFFIX: staging.1
+      AGE_H: ${{ github.event.inputs.min_age_hours }}
+      # Scheduled and dispatched runs always publish, and always signed.
+      AUTO: 'false'
+      IN_PUBLISH: 'false'
+      IN_SIGN: 'false'
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Self-test the packaging + validation scripts
+        run: |
+          python3 tooling/scripts/unsloth/test_prebuilt_scripts.py
+          python3 tooling/scripts/unsloth/test_windows_arm64_prebuilts.py
+
+      - name: Resolve immutable commit + stamp source tree
+        id: r
+        run: |
+          set -euo pipefail
+          SHAPE='^v[0-9][A-Za-z0-9._-]*$'
+          [ -n "$AGE_H" ] || AGE_H=6
+          printf '%s' "$AGE_H" | grep -qE '^[0-9]+$' || { echo "refusing min_age_hours '$AGE_H'" >&2; exit 1; }
+          REPO="$GITHUB_REPOSITORY"
+
+          # "latest": newest non-draft, non-prerelease upstream release public
+          # for >= AGE_H hours (a yanked tag is not shipped the minute it
+          # appears). Shape is part of the selection: old release-0.x tags do
+          # not match. List order is not guaranteed, so take max published_at.
+          if [ "$UT" = "latest" ]; then
+            CUTOFF="$(date -u -d "-${AGE_H} hours" +%s)"
+            UT="$(gh api 'repos/0xShug0/audio.cpp/releases?per_page=100' \
+              --jq "[.[] | select(.draft==false and .prerelease==false) | select(.tag_name|test(\"${SHAPE}\")) | select((.published_at|fromdateiso8601) <= ${CUTOFF})] | max_by(.published_at|fromdateiso8601) | .tag_name")"
+            if [ -z "$UT" ] || [ "$UT" = "null" ]; then
+              echo "refusing: no v<version> 0xShug0/audio.cpp release older than ${AGE_H}h in the last 100 releases" >&2
+              exit 1
+            fi
+            echo "selected upstream ${UT} (aged >= ${AGE_H}h)"
+          fi
+          printf '%s' "$UT" | grep -qE "$SHAPE" \
+            || { echo "refusing upstream tag '$UT' (want v<version>[-label])" >&2; exit 1; }
+
+          # Blank suffix (every automatic run): the newest published unsloth.N
+          # of this upstream tag, so "published at any ordinal" makes exists
+          # true below; with none published, unsloth.1. Must run after UT is a
+          # concrete tag. --paginate emits one ordinal per line across pages.
+          if [ -z "$SUFFIX" ]; then
+            NEWEST_ORD="$(gh api --paginate "repos/${REPO}/releases?per_page=100" \
+              --jq ".[] | select(.draft==false) | .tag_name
+                    | select(startswith(\"${UT}-unsloth.\"))
+                    | ltrimstr(\"${UT}-unsloth.\")
+                    | select(test(\"^[0-9]+$\"))" | sort -n | tail -n 1)"
+            SUFFIX="unsloth.${NEWEST_ORD:-1}"
+            echo "no packaging suffix given; using ${SUFFIX}"
+          fi
+          printf '%s' "$SUFFIX" | grep -qE '^[A-Za-z0-9._-]+$' \
+            || { echo "refusing packaging suffix '$SUFFIX'" >&2; exit 1; }
+          TAG="${UT}-${SUFFIX}"
+
+          # Annotated tags resolve to the tag object first, then its commit.
+          REF_JSON="$(gh api "repos/0xShug0/audio.cpp/git/ref/tags/${UT}")"
+          OBJ_TYPE="$(jq -r '.object.type' <<<"$REF_JSON")"
+          OBJ_SHA="$(jq -r '.object.sha' <<<"$REF_JSON")"
+          if [ "$OBJ_TYPE" = "tag" ]; then
+            COMMIT="$(gh api "repos/0xShug0/audio.cpp/git/tags/${OBJ_SHA}" --jq '.object.sha')"
+          else
+            COMMIT="$OBJ_SHA"
+          fi
+          printf '%s' "$COMMIT" | grep -qE '^[0-9a-f]{40}$' \
+            || { echo "could not resolve ${UT} to a commit" >&2; exit 1; }
+          echo "resolved ${UT} -> ${COMMIT}"
+
+          # A draft is a failed earlier run: "not published", rebuilt below.
+          EXISTS=false
+          if [ "$(gh release view "$TAG" --repo "$REPO" --json isDraft --jq .isDraft 2>/dev/null || true)" = "false" ]; then
+            EXISTS=true
+            if [ "$AUTO" = "true" ]; then
+              echo "${TAG} is already published; nothing to do"
+            else
+              echo "::notice::${TAG} is already published; building for artifacts only, never republishing"
+            fi
+          fi
+          if [ "$AUTO" = "true" ]; then
+            SIGN=true; PUBLISH=true
+          else
+            SIGN="$IN_SIGN"; PUBLISH="$IN_PUBLISH"
+          fi
+          if [ "$EXISTS" = "true" ]; then PUBLISH=false; fi
+
+          git init -q audio-src
+          git -C audio-src remote add origin https://github.com/0xShug0/audio.cpp.git
+          git -C audio-src fetch -q --depth 1 origin "$COMMIT"
+          git -C audio-src checkout -q --detach FETCH_HEAD
+          [ "$(git -C audio-src rev-parse HEAD)" = "$COMMIT" ] || { echo "fetched the wrong commit" >&2; exit 1; }
+          DATE="$(git -C audio-src show -s --format=%cs HEAD)"
+          bash tooling/scripts/unsloth/stamp_source.sh audio-src "$COMMIT" "$DATE"
+
+          # The eSpeak-ng the build fetches (tools/cmake/espeak_static.cmake),
+          # pinned to its commit for the GPL source note in every bundle.
+          ESPEAK_TAG="$(sed -nE 's|^[[:space:]]*URL[[:space:]]+https://codeload.github.com/espeak-ng/espeak-ng/tar.gz/refs/tags/([^[:space:]]+)$|\1|p' \
+            audio-src/tools/cmake/espeak_static.cmake)"
+          [ -n "$ESPEAK_TAG" ] || { echo "could not read the eSpeak-ng tag from espeak_static.cmake" >&2; exit 1; }
+          ESPEAK_COMMIT="$(git ls-remote https://github.com/espeak-ng/espeak-ng "refs/tags/${ESPEAK_TAG}^{}" | cut -f1)"
+          [ -n "$ESPEAK_COMMIT" ] || ESPEAK_COMMIT="$(git ls-remote https://github.com/espeak-ng/espeak-ng "refs/tags/${ESPEAK_TAG}" | cut -f1)"
+          printf '%s' "$ESPEAK_COMMIT" | grep -qE '^[0-9a-f]{40}$' \
+            || { echo "could not resolve eSpeak-ng ${ESPEAK_TAG} to a commit" >&2; exit 1; }
+          echo "eSpeak-ng ${ESPEAK_TAG} -> ${ESPEAK_COMMIT}"
+
+          # Submodules (the optional web frontends) are not needed for
+          # audiocpp_server and are not part of the stamped source.
+          tar -czf "${RUNNER_TEMP}/audio.cpp-source-${TAG}.tar.gz" \
+            --exclude-vcs --transform "s,^audio-src,audio.cpp-${TAG}," audio-src
+
+          {
+            echo "upstream_tag=$UT"
+            echo "tag=$TAG"
+            echo "commit=$COMMIT"
+            echo "repo=$REPO"
+            echo "source_artifact=audio-source-${TAG}"
+            echo "exists=$EXISTS"
+            echo "espeak_commit=$ESPEAK_COMMIT"
+            echo "sign_windows=$SIGN"
+            echo "publish=$PUBLISH"
+          } >> "$GITHUB_OUTPUT"
+          echo "Resolved $UT -> $TAG ($COMMIT); release exists=$EXISTS; publish=$PUBLISH; sign_windows=$SIGN"
+
+      - name: Upload stamped source artifact
+        if: ${{ true }}
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f  # v6.0.0
+        with:
+          name: ${{ steps.r.outputs.source_artifact }}
+          path: ${{ runner.temp }}/audio.cpp-source-${{ steps.r.outputs.tag }}.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+
+  windows-arm64:
+    name: windows/arm64-${{ matrix.accel }}
+    # Native builds run the static eSpeak data generators and the CPU smoke test.
+    runs-on: windows-11-arm
+    timeout-minutes: 350
+    needs: resolve
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { accel: cpu, expect: 'cpu' }
+          - { accel: cuda13, expect: 'cpu,cuda' }
+    defaults:
+      run: { shell: pwsh }
+    steps:
+      - name: Checkout build tooling (this repo)
+        uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803  # v6.1.0
+        with: { path: tooling, persist-credentials: false }
+
+      - name: Download stamped source @ ${{ needs.resolve.outputs.tag }}
+        uses: actions/download-artifact@018cc2cf5baa6db3ef3c5f8a56943fffe632ef53
+        with: { name: "${{ needs.resolve.outputs.source_artifact }}", path: srcpkg }
+
+      - name: Extract and verify source
+        run: |
+          New-Item -ItemType Directory -Path src | Out-Null
+          tar.exe -xzf "srcpkg/audio.cpp-source-${{ needs.resolve.outputs.tag }}.tar.gz" -C src --strip-components=1
+          if ($LASTEXITCODE -ne 0) { throw 'source extraction failed' }
+          if ((Get-Content -Raw src/UNSLOTH_SOURCE_COMMIT).Trim() -ne '${{ needs.resolve.outputs.commit }}') { throw 'source SHA mismatch' }
+
+      - name: Native ARM64 Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1  # v6.3.0
+        with: { python-version: '3.13', architecture: arm64 }
+
+      - name: Setup MSVC (ARM64 headers, linker, runtime and nvcc host compiler)
+        uses: ilammy/msvc-dev-cmd@0b201ec74fa43914dc39ae48a89fd1d8cb592756
+        with: { arch: arm64 }
+
+      - name: Check native build tools
+        run: |
+          # The native runner ships LLVM, CMake and Ninja. Do not silently use
+          # emulated x64 clang: eSpeak configures a child project with that path.
+          clang --version
+          if ($LASTEXITCODE -ne 0) { throw 'native LLVM is required' }
+          cmake --version
+          if ($LASTEXITCODE -ne 0) { throw 'CMake is required' }
+          ninja --version
+          if ($LASTEXITCODE -ne 0) { throw 'Ninja is required' }
+
+      - name: Install pinned CUDA 13.4.1 ARM64 redistributables
+        if: matrix.accel == 'cuda13'
+        run: |
+          & tooling/scripts/unsloth/setup_cuda_windows_arm64.ps1 `
+            -Destination "$env:RUNNER_TEMP/cuda-arm64" -Stage "$env:RUNNER_TEMP/cuda-redist"
+          if ($LASTEXITCODE -ne 0) { throw 'CUDA installation failed' }
+
+      - name: Build native server, eSpeak and CUDA audio kernels
+        run: |
+          & tooling/scripts/unsloth/build_windows_arm64.ps1 `
+            -Source "$env:GITHUB_WORKSPACE/src" -Build "$env:GITHUB_WORKSPACE/build" `
+            -Version '${{ needs.resolve.outputs.tag }}' -Accelerator '${{ matrix.accel }}'
+          if ($LASTEXITCODE -ne 0) { throw 'ARM64 build failed' }
+          "BIN_DIR=$env:GITHUB_WORKSPACE/build/bin" | Add-Content $env:GITHUB_ENV
+
+      - name: Collect ARM64 CUDA runtime DLLs
+        if: matrix.accel == 'cuda13'
+        run: |
+          New-Item -ItemType Directory -Path cudart | Out-Null
+          foreach ($pattern in 'cudart64_*.dll', 'cublas64_*.dll', 'cublasLt64_*.dll', 'cufft64_*.dll') {
+            $dlls = @(Get-ChildItem -Path "$env:CUDA_PATH/bin/arm64/$pattern")
+            if ($dlls.Count -eq 0) { throw "missing ARM64 $pattern" }
+            $dlls | Copy-Item -Destination cudart
+          }
+          python tooling/scripts/unsloth/check_windows_arch.py --dir cudart --arch arm64
+          if ($LASTEXITCODE -ne 0) { throw 'wrong CUDA runtime architecture' }
+
+      - name: Bundle ARM64 VC runtime
+        run: |
+          $vswhere = "${env:ProgramFiles(x86)}/Microsoft Visual Studio/Installer/vswhere.exe"
+          $vs = & $vswhere -latest -property installationPath
+          $redist = Get-ChildItem "$vs/VC/Redist/MSVC" -Directory |
+            Sort-Object { try { [version]$_.Name } catch { [version]'0.0' } } -Descending |
+            Select-Object -First 1
+          $crt = Join-Path $redist.FullName 'arm64/Microsoft.VC143.CRT'
+          if (-not (Test-Path -LiteralPath $crt)) { throw "missing ARM64 VC runtime: $crt" }
+          Get-ChildItem "$crt/*.dll" | Where-Object { $_.Name -match '^(vcruntime140|msvcp140)' } |
+            Copy-Item -Destination $env:BIN_DIR
+
+      - name: Sign Windows ARM64 binaries
+        id: sign
+        if: false
+        uses: ./tooling/.github/actions/sign-windows
+        with:
+          path: ${{ env.BIN_DIR }}
+          azure-client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          azure-client-secret: ${{ secrets.AZURE_CLIENT_SECRET }}
+          azure-tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          azure-account: ${{ secrets.AZURE_TRUSTED_SIGNING_ACCOUNT_NAME }}
+          azure-certificate-profile: ${{ secrets.AZURE_CERTIFICATE_PROFILE_NAME }}
+
+      - name: Package ARM64 server and runtime companion
+        run: |
+          $pkgArgs = @('--bin-dir', $env:BIN_DIR, '--src-dir', 'src', '--out-dir', 'dist',
+            '--tag', '${{ needs.resolve.outputs.tag }}', '--upstream-tag', '${{ needs.resolve.outputs.upstream_tag }}',
+            '--commit', '${{ needs.resolve.outputs.commit }}', '--source-repo', '${{ needs.resolve.outputs.repo }}',
+            '--os', 'windows', '--arch', 'arm64', '--accel', '${{ matrix.accel }}',
+            '--min-os', 'windows-11', '--espeak-commit', '${{ needs.resolve.outputs.espeak_commit }}')
+          if ('${{ matrix.accel }}' -eq 'cuda13') {
+            # Static CUDA imports these DLLs even for --version; no driver import (NO_VMM).
+            $env:PATH = "$env:GITHUB_WORKSPACE/cudart;$env:PATH"
+            $pkgArgs += @('--runtime-line', 'cuda13', '--cuda-toolkit', '13.4.1', '--sms', '121-real;120-real;100-virtual')
+          }
+          python tooling/scripts/unsloth/package_bundle.py @pkgArgs
+          if ($LASTEXITCODE -ne 0) { throw 'ARM64 packaging failed' }
+          if ('${{ matrix.accel }}' -eq 'cuda13') {
+            python tooling/scripts/unsloth/package_bundle.py --cudart-dir cudart --out-dir dist `
+              --tag '${{ needs.resolve.outputs.tag }}' --arch arm64 --accel cuda13
+            if ($LASTEXITCODE -ne 0) { throw 'ARM64 runtime packaging failed' }
+          }
+
+      - name: Verify every shipped PE signature
+        if: false && steps.sign.outputs.signed == 'true'
+        run: |
+          $zips = @(Get-ChildItem dist -Filter 'audio-*-bin-*.zip' | ForEach-Object { $_.FullName })
+          if ($zips.Count -eq 0) { throw 'no bundle in dist/' }
+          & tooling/.github/scripts/assert-windows-bundle-signed.ps1 -Path $zips
+          if ($LASTEXITCODE -ne 0) { throw 'bundle signature check failed' }
+
+      - name: Cache smoke models
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9
+        with: { path: smoke-models, key: "${{ env.SMOKE_MODELS_KEY }}", enableCrossOsArchive: true }
+
+      - name: Validate finished ARM64 bundle and CPU fallback (Kokoro + Moonshine)
+        run: |
+          $bundle = "dist/audio-${{ needs.resolve.outputs.tag }}-bin-windows-arm64-${{ matrix.accel }}.zip"
+          $unpacked = Join-Path $env:RUNNER_TEMP 'arm64-bundle-check'
+          Expand-Archive $bundle $unpacked
+          python tooling/scripts/unsloth/check_windows_arch.py --dir $unpacked --arch arm64
+          if ($LASTEXITCODE -ne 0) { throw 'wrong bundle architecture' }
+          $extra = @()
+          if ('${{ matrix.accel }}' -eq 'cuda13') {
+            $runtime = Join-Path $env:RUNNER_TEMP 'arm64-cudart-check'
+            Expand-Archive "dist/audio-${{ needs.resolve.outputs.tag }}-cudart-windows-arm64-cuda13.zip" $runtime
+            python tooling/scripts/unsloth/check_windows_arch.py --dir $runtime --arch arm64
+            if ($LASTEXITCODE -ne 0) { throw 'wrong runtime ZIP architecture' }
+            $extra += @('--lib-path', $runtime)
+          }
+          python tooling/scripts/unsloth/validate_bundle.py --bundle $bundle `
+            --expect-backends '${{ matrix.expect }}' --smoke --backend cpu --models-dir smoke-models @extra
+          if ($LASTEXITCODE -ne 0) { throw 'ARM64 runtime validation failed' }
+
+      - name: Upload ARM64 bundle artifact
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: audio-${{ needs.resolve.outputs.tag }}-bin-windows-arm64-${{ matrix.accel }}
+          path: dist/audio-${{ needs.resolve.outputs.tag }}-bin-windows-arm64-${{ matrix.accel }}.zip
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Upload ARM64 CUDA runtime artifact
+        if: matrix.accel == 'cuda13'
+        uses: actions/upload-artifact@b7c566a772e6b6bfb58ed0dc250532a479d7789f
+        with:
+          name: audio-${{ needs.resolve.outputs.tag }}-cudart-windows-arm64-cuda13
+          path: dist/audio-${{ needs.resolve.outputs.tag }}-cudart-windows-arm64-cuda13.zip
+          if-no-files-found: error
+          retention-days: 7
+
