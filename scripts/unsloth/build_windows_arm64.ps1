@@ -16,6 +16,9 @@ $target = & clang -dumpmachine
 if ($LASTEXITCODE -ne 0 -or $target -notmatch '^(aarch64|arm64).*-windows') {
     throw "Native ARM64 LLVM is required; clang target is $target"
 }
+# eSpeak 1.52 compat/getopt.c passes char* where char** is expected; clang 16+
+# makes that an error. CFLAGS reaches the eSpeak child configure too.
+$env:CFLAGS = "$env:CFLAGS -Wno-error=incompatible-pointer-types".Trim()
 $cuda = if ($Accelerator -eq 'cuda13') { 'ON' } else { 'OFF' }
 $configureArgs = @('-S', $Source, '-B', $Build, '-G', 'Ninja', '-DCMAKE_BUILD_TYPE=Release',
     "-DCMAKE_TOOLCHAIN_FILE=$PSScriptRoot/windows_arm64_native.cmake",
