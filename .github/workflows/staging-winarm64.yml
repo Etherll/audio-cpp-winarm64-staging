@@ -246,6 +246,12 @@ jobs:
           if ($LASTEXITCODE -ne 0) { throw 'ARM64 build failed' }
           "BIN_DIR=$env:GITHUB_WORKSPACE/build/bin" | Add-Content $env:GITHUB_ENV
 
+      - name: "staging: dump eSpeak sub-build logs"
+        if: failure()
+        run: |
+          Get-ChildItem -Recurse build/audiocpp_espeak_source-prefix/src/audiocpp_espeak_source-stamp -Filter '*.log' -ErrorAction SilentlyContinue |
+            ForEach-Object { "===== $($_.FullName)"; Get-Content $_.FullName -Tail 120 }
+
       - name: Collect ARM64 CUDA runtime DLLs
         if: matrix.accel == 'cuda13'
         run: |
