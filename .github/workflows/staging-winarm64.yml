@@ -250,7 +250,11 @@ jobs:
         if: failure()
         run: |
           Get-ChildItem -Recurse build/audiocpp_espeak_source-prefix/src/audiocpp_espeak_source-stamp -Filter '*.log' -ErrorAction SilentlyContinue |
-            ForEach-Object { "===== $($_.FullName)"; Get-Content $_.FullName -Tail 120 }
+            ForEach-Object {
+              "===== $($_.FullName)"
+              Select-String -Path $_.FullName -Pattern 'FAILED|error|fatal|LINK :' -Context 3,25 |
+                Where-Object { $_.Line -notmatch 'warning|deprecat|_error\(|runtime_error' } | Select-Object -First 6 | Out-String -Width 400
+            }
 
       - name: Collect ARM64 CUDA runtime DLLs
         if: matrix.accel == 'cuda13'
